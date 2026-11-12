@@ -125,6 +125,7 @@ summary { cursor: pointer; color: var(--ink); }
       <h2>Your takes for this item</h2>
       <button id="playTake" disabled>▶ Play this take</button>
       <button id="saveTake" disabled>Save this take</button>
+      <button id="dlTake" disabled>Download</button>
     </div>
     <ul id="savedList"></ul>
   </section>
@@ -132,7 +133,7 @@ summary { cursor: pointer; color: var(--ink); }
   <details>
     <summary>How it works</summary>
     <p>Pick the day and an item, press <b>Start mic</b> and say it. Your pitch line starts when your voice does, and the take ends after a second of silence. The shaded bands are the plan's targets, 5 Hz either side; the faint line is your previous take. After each take your line is stretched to the length of the target, so the score compares shape and height, not speed. Slower and Slow stretch the targets while you speak.</p>
-    <p><b>Save this take</b> keeps the recording and its pitch line on this device, under the item you said it for. Tap <b>Play</b> on a saved take to hear it again while a marker runs along your line, so you can hear where it left the band. Saved takes stay until you delete them; they don't sync between your iPhone and Mac.</p>
+    <p><b>Save this take</b> keeps the recording and its pitch line on this device, under the item you said it for. Tap <b>Play</b> on a saved take to hear it again while a marker runs along your line, so you can hear where it left the band. Saved takes stay until you delete them; they don't sync between your iPhone and Mac. <b>Download</b> saves a take as a WAV file (through the share sheet on iPhone: pick Save to Files), named like your Praat files, so you can keep it in iCloud Drive and open it in Praat.</p>
     <p>Where the microphone isn't allowed (inside claude.ai), record the item in Voice Memos, share it to Files, and use <b>Load a recording</b>. The page measures the whole recording and draws it the same way.</p>
     <p>The pitch tracker here is a simple one for practice. Tone 3's creaky bottom often drops out, and that's normal. For the real checks, keep using Praat. Numbers come from <code>pronunciation-plan-11nov-4dec.md</code> and <code>tone-targets-94hz.md</code>.</p>
   </details>
@@ -485,11 +486,13 @@ summary { cursor: pointer; color: var(--ink); }
     const ok = !!(take && take.done && take.audio && item.kind !== 'free');
     $('playTake').disabled = !ok; $('saveTake').disabled = !ok || !!take.savedId;
     $('saveTake').textContent = take && take.savedId ? 'Saved' : 'Save this take';
+    $('dlTake').disabled = !ok;
   }
   async function saveTake() {
     const t = take; if (!t || !t.audio) return;
     const a0 = t.audioStart || 0;
-    const rec = { item: itemKey(item), title: item.title, day: day.day, savedAt: Date.now(), p5: t.p5 ?? null, p10: t.p10 ?? null,
+    t.savedAt = Date.now();
+    const rec = { item: itemKey(item), title: item.title, day: day.day, savedAt: t.savedAt, p5: t.p5 ?? null, p10: t.p10 ?? null,
       frames: t.frames.map(f => [Math.round((f.t - a0) * 1000), f.hz == null ? null : Math.round(f.hz * 10) / 10]),
       pcm: to16k(t.audio, t.sr).buffer };
     try { const id = await tx('readwrite', os => os.add(rec)); t.savedId = id; status('Take saved on this device.'); }
@@ -519,14 +522,16 @@ summary { cursor: pointer; color: var(--ink); }
         if (take && take.savedId === r.id) take.savedId = null;
         updateTakeButtons(); renderSaved();
       };
-      li.append(play, show, del); ul.appendChild(li);
+      const dl = document.createElement('button'); dl.textContent = 'Download';
+      dl.onclick = () => { const i16 = new Int16Array(r.pcm); downloadWav(i16, 16000, fileName(r.savedAt)); };
+      li.append(play, show, dl, del); ul.appendChild(li);
     });
   }
   function showSaved(r) {
     stopPlayback();
     const i16 = new Int16Array(r.pcm), x = new Float32Array(i16.length); for (let i = 0; i < x.length; i++) x[i] = i16[i] / 32768;
     if (take && take !== null && !take.savedId) lastTake = take;
-    const t = { frames: r.frames.map(([ms, hz]) => ({ t: ms / 1000, hz })), done: true, audio: x, sr: 16000, audioStart: 0, savedId: r.id, map: tt => tt };
+    const t = { frames: r.frames.map(([ms, hz]) => ({ t: ms / 1000, hz })), done: true, audio: x, sr: 16000, audioStart: 0, savedId: r.id, savedAt: r.savedAt, map: tt => tt };
     take = t; finishTake(t);
     const when = new Date(r.savedAt).toLocaleString(undefined, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
     status('Showing your saved take from ' + when + '.');
@@ -548,6 +553,42 @@ summary { cursor: pointer; color: var(--ink); }
     const tick = () => { if (!playing || playing.node !== node) return; playing.pos = (t.audioStart || 0) + Math.max(0, ac.currentTime - t0); if (!running) draw(); requestAnimationFrame(tick); };
     tick();
   }
+  function wavBlob(i16, sr) {
+    const b = new ArrayBuffer(44 + i16.length * 2), v = new DataView(b), w = (o, str) => { for (let i = 0; i < str.length; i++) v.setUint8(o + i, str.charCodeAt(i)); };
+    w(0, 'RIFF'); v.setUint32(4, 36 + i16.length * 2, true); w(8, 'WAVE'); w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, sr, true); v.setUint32(28, sr * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, 'data'); v.setUint32(40, i16.length * 2, true);
+    new Int16Array(b, 44).set(i16);
+    return new Blob([b], { type: 'audio/wav' });
+  }
+  function ascii(str) { return (str || '').normalize('NFD').replace(/ü/g, 'v').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ''); }
+  function fileName(when) {
+    const it = item, d = new Date(when || Date.now()), pad = n => String(n).padStart(2, '0');
+    let stem;
+    if (it.kind === 'pair') stem = it.audio;
+    else if (it.kind === 'tone') stem = 'tone' + it.segs[0].tone;
+    else if (it.kind === 'sentence') { const m = it.title.match(/^Day (\d+)([ab])/); stem = m ? `day-${pad(m[1])}-${m[2]}` : ascii(it.pinyin); }
+    else stem = ascii(it.pinyin).slice(0, 40) || 'take';
+    return `${stem}_me_${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.wav`;
+  }
+  async function downloadWav(i16, sr, name) {
+    const blob = wavBlob(i16, sr);
+    try {   // claude.ai copy: the viewer's own save dialog
+      const dlc = window.claude && window.claude.use ? await Promise.race([window.claude.use('downloads'), new Promise(r => setTimeout(() => r(null), 1500))]) : null;
+      if (dlc) { await dlc.save({ filename: name, data: blob }); status('Saved ' + name + '.'); return; }
+    } catch (e) { if (e && e.code && e.code !== 'unavailable') { status('Download cancelled.'); return; } }
+    const file = new File([blob], name, { type: 'audio/wav' });
+    if (navigator.canShare && navigator.share && /iPhone|iPad|iPod/.test(navigator.userAgent) && navigator.canShare({ files: [file] })) {
+      try { await navigator.share({ files: [file] }); status('Shared ' + name + '. Pick Save to Files to keep it in iCloud Drive.'); return; } catch (e) { if (e && e.name === 'AbortError') return; }
+    }
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+    status('Downloaded ' + name + '.');
+  }
+  $('dlTake').onclick = () => {
+    const t = take; if (!t || !t.audio) return;
+    const x = t.audio, i16 = new Int16Array(x.length); for (let i = 0; i < x.length; i++) i16[i] = Math.max(-32768, Math.min(32767, Math.round(x[i] * 32767)));
+    downloadWav(i16, Math.round(t.sr), fileName(t.savedAt));
+  };
   $('saveTake').onclick = saveTake;
   $('playTake').onclick = playTake;
 

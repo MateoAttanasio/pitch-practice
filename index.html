@@ -68,6 +68,17 @@ canvas { display: block; width: 100%; height: 300px; touch-action: manipulation;
 .status.warn { color: var(--warn); }
 .listen { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 0.85rem; color: var(--muted); }
 .listen button { padding: 6px 10px; font-size: 0.85rem; }
+.takes { background: var(--panel); border: 1px solid var(--rule); border-radius: 12px; padding: 12px 14px; display: grid; gap: 10px; }
+.takes .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.takes h2 { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 500; margin: 0; flex: 1 1 auto; }
+.takes ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.takes li { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding-top: 6px; border-top: 1px solid var(--rule); }
+.takes li .when { font-family: var(--mono); font-size: 0.85rem; font-variant-numeric: tabular-nums; flex: 1 1 10em; min-width: 0; }
+.takes li .when small { color: var(--muted); }
+.takes li button { padding: 5px 10px; font-size: 0.85rem; }
+.takes li.current { border-top-color: var(--voice); }
+.takes .empty { color: var(--muted); font-size: 0.88rem; }
+button.danger { color: var(--voice); border-color: var(--voice); }
 details { font-size: 0.88rem; color: var(--muted); }
 details p { margin: 6px 0; max-width: 68ch; }
 summary { cursor: pointer; color: var(--ink); }
@@ -109,9 +120,19 @@ summary { cursor: pointer; color: var(--ink); }
 
   <div class="listen" id="listen"></div>
 
+  <section class="takes" aria-label="Your takes">
+    <div class="bar">
+      <h2>Your takes for this item</h2>
+      <button id="playTake" disabled>▶ Play this take</button>
+      <button id="saveTake" disabled>Save this take</button>
+    </div>
+    <ul id="savedList"></ul>
+  </section>
+
   <details>
     <summary>How it works</summary>
     <p>Pick the day and an item, press <b>Start mic</b> and say it. Your pitch line starts when your voice does, and the take ends after a second of silence. The shaded bands are the plan's targets, 5 Hz either side; the faint line is your previous take. After each take your line is stretched to the length of the target, so the score compares shape and height, not speed. Slower and Slow stretch the targets while you speak.</p>
+    <p><b>Save this take</b> keeps the recording and its pitch line on this device, under the item you said it for. Tap <b>Play</b> on a saved take to hear it again while a marker runs along your line, so you can hear where it left the band. Saved takes stay until you delete them; they don't sync between your iPhone and Mac.</p>
     <p>Where the microphone isn't allowed (inside claude.ai), record the item in Voice Memos, share it to Files, and use <b>Load a recording</b>. The page measures the whole recording and draws it the same way.</p>
     <p>The pitch tracker here is a simple one for practice. Tone 3's creaky bottom often drops out, and that's normal. For the real checks, keep using Praat. Numbers come from <code>pronunciation-plan-11nov-4dec.md</code> and <code>tone-targets-94hz.md</code>.</p>
   </details>
@@ -162,8 +183,8 @@ summary { cursor: pointer; color: var(--ink); }
   function setItem() {
     item = items[+itemSel.value];
     store.set('pp-day', daySel.value); store.set('pp-date', new Date().toDateString()); store.set('pp-item-' + day.day, itemSel.value);
-    lastTake = null; take = null; resetScores();
-    renderCard(); renderListen(); layoutTarget(); draw();
+    lastTake = null; take = null; resetScores(); stopPlayback();
+    renderCard(); renderSaved(); updateTakeButtons(); renderListen(); layoutTarget(); draw();
   }
   function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
   function renderCard() {
@@ -275,6 +296,10 @@ summary { cursor: pointer; color: var(--ink); }
     }
     if (lastTake) plot(lastTake.frames, C.old, 3, lastTake.map);
     if (take) plot(take.frames, C.voice, 3, take.map);
+    if (playing && take === playing.take && take.map) {
+      const px = x(take.map(playing.pos));
+      if (px >= L && px <= W - R) { ctx.strokeStyle = C.ink; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(px, T); ctx.lineTo(px, T + ph); ctx.stroke(); }
+    }
   }
 
   // ---------- pitch tracking (YIN on a 2x downsampled signal) ----------
@@ -341,8 +366,9 @@ summary { cursor: pointer; color: var(--ink); }
     if (n) {
       const p5 = Math.round(100 * n5 / n), p10 = Math.round(100 * n10 / n);
       $('in5').innerHTML = `${p5}%<small> ±5 Hz</small>`; $('in10').innerHTML = `${p10}%<small> ±10 Hz</small>`;
+      t.p5 = p5; t.p10 = p10;
     }
-    draw();
+    updateTakeButtons(); draw();
   }
   function framesFromSamples(x, sr) {
     // offline: 10 ms hop, ~43 ms window, same tracker as live
@@ -369,26 +395,29 @@ summary { cursor: pointer; color: var(--ink); }
     const sink = ac.createGain(); sink.gain.value = 0;
     src.connect(proc); proc.connect(sink); sink.connect(ac.destination);
     const sr = ac.sampleRate, N = sr > 30000 ? 2048 : 1024, ring = new Float32Array(N); let filled = 0;
-    const sm = smoother(); let clock = 0, silence = 0, run = 0;
+    const sm = smoother(); let clock = 0, silence = 0, run = 0; const pre = []; let preLen = 0;
     proc.onaudioprocess = ev => {
       const inp = ev.inputBuffer.getChannelData(0);
       ring.copyWithin(0, inp.length); ring.set(inp, N - inp.length); filled += inp.length; clock += inp.length / sr;
+      const chunk = new Float32Array(inp); pre.push({ t: clock - inp.length / sr, d: chunk }); preLen += chunk.length;
+      while (preLen - pre[0].d.length > sr * 0.6) preLen -= pre.shift().d.length;   // keep the last ~0.6 s for the take's start
+      if (take && !take.done && take.chunks) take.chunks.push(chunk);
       if (filled < N) return;
       const r = yin(down2(ring, 0, N), sr / 2), hz = sm(r.hz);
       liveFrames.push({ t: clock, hz }); if (liveFrames.length > 1500) liveFrames.splice(0, 500);
       nowHz = hz;
       if (item.kind === 'free') return;
       run = hz != null ? run + 1 : 0;
-      if (run >= 4 && (!take || (take.done && clock - take.end > 0.3))) {
+      if (run >= 4 && !playing && (!take || (take.done && clock - take.end > 0.3))) {
         if (take) lastTake = take;
         const recent = liveFrames.slice(-4);
-        const nt = { frames: recent.slice(0, 3), start: recent[0].t - 0.01, map: null }; nt.map = tt => (tt - nt.start) + tl[0].t0 * speed; take = nt; silence = 0; resetScores();
+        const nt = { frames: recent.slice(0, 3), start: recent[0].t - 0.01, map: null, sr, audioStart: pre[0].t, chunks: pre.map(c => c.d) }; nt.map = tt => (tt - nt.start) + tl[0].t0 * speed; take = nt; silence = 0; resetScores();
       }
       if (take && !take.done) {
         take.frames.push({ t: clock, hz });
         silence = hz == null ? silence + inp.length / sr : 0;
         const tooLong = clock - take.start > tTotal * speed * 2.2 + 2;
-        if ((silence > 0.9 && take.frames.some(f => f.hz != null)) || tooLong) { take.done = true; take.end = clock; finishTake(take); status('Take scored. Say it again whenever you like; the faint line is your previous take.'); }
+        if ((silence > 0.9 && take.frames.some(f => f.hz != null)) || tooLong) { take.done = true; take.end = clock; take.audio = joinChunks(take.chunks); take.chunks = null; finishTake(take); status('Take scored. Say it again whenever you like; the faint line is your previous take.'); }
       }
     };
     running = true; $('mic').textContent = 'Stop mic'; $('mic').classList.add('on');
@@ -421,7 +450,7 @@ summary { cursor: pointer; color: var(--ink); }
       const audio = await new Promise((res, rej) => { const p = ac.decodeAudioData(buf, res, rej); if (p && p.then) p.then(res, rej); });
       const x = audio.getChannelData(0), frames = cleanRuns(framesFromSamples(x, audio.sampleRate));
       if (take) lastTake = take;
-      const t = { frames, done: true, map: tt => tt };
+      const t = { frames, done: true, map: tt => tt, audio: x, sr: audio.sampleRate, audioStart: 0 };
       if (item.kind === 'free') { liveFrames = frames.map(fr => ({ ...fr })); draw(); status('Loaded. Showing the last 5 seconds of the recording.'); }
       else {
         take = t; finishTake(t);
@@ -433,6 +462,95 @@ summary { cursor: pointer; color: var(--ink); }
     $('file').value = '';
   };
 
+  // ---------- saving and replaying takes ----------
+  function joinChunks(cs) { let n = 0; cs.forEach(c => n += c.length); const out = new Float32Array(n); let o = 0; cs.forEach(c => { out.set(c, o); o += c.length; }); return out; }
+  function to16k(x, sr) {   // box-filter and resample to 16 kHz, 16-bit, for storage
+    const r = sr / 16000, n = Math.floor(x.length / r), out = new Int16Array(n);
+    for (let i = 0; i < n; i++) { const a = Math.floor(i * r), b = Math.max(a + 1, Math.floor((i + 1) * r)); let s = 0; for (let j = a; j < b; j++) s += x[j]; out[i] = Math.max(-32768, Math.min(32767, Math.round(s / (b - a) * 32767))); }
+    return out;
+  }
+  const itemKey = it => it.title + '|' + (it.pinyin || '');
+  let dbp = null;
+  function db() {
+    if (!dbp) dbp = new Promise((res, rej) => {
+      try { const q = indexedDB.open('pitch-practice', 1);
+        q.onupgradeneeded = () => { const os = q.result.createObjectStore('takes', { keyPath: 'id', autoIncrement: true }); os.createIndex('item', 'item'); };
+        q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error);
+      } catch (e) { rej(e); }
+    });
+    return dbp;
+  }
+  function tx(mode, fn) { return db().then(d => new Promise((res, rej) => { const t = d.transaction('takes', mode), r = fn(t.objectStore('takes')); t.oncomplete = () => res(r && r.result); t.onerror = () => rej(t.error); })); }
+  function updateTakeButtons() {
+    const ok = !!(take && take.done && take.audio && item.kind !== 'free');
+    $('playTake').disabled = !ok; $('saveTake').disabled = !ok || !!take.savedId;
+    $('saveTake').textContent = take && take.savedId ? 'Saved' : 'Save this take';
+  }
+  async function saveTake() {
+    const t = take; if (!t || !t.audio) return;
+    const a0 = t.audioStart || 0;
+    const rec = { item: itemKey(item), title: item.title, day: day.day, savedAt: Date.now(), p5: t.p5 ?? null, p10: t.p10 ?? null,
+      frames: t.frames.map(f => [Math.round((f.t - a0) * 1000), f.hz == null ? null : Math.round(f.hz * 10) / 10]),
+      pcm: to16k(t.audio, t.sr).buffer };
+    try { const id = await tx('readwrite', os => os.add(rec)); t.savedId = id; status('Take saved on this device.'); }
+    catch (e) { status('Couldn\'t save here (this browser may block storage, for example in a private window).', true); }
+    updateTakeButtons(); renderSaved();
+  }
+  async function renderSaved() {
+    const ul = $('savedList'), key = itemKey(item);
+    if (item.kind === 'free') { ul.innerHTML = '<li class="empty">Pick a plan item to save takes.</li>'; return; }
+    let rows = [];
+    try { rows = await tx('readonly', os => os.index('item').getAll(key)) || []; } catch (e) { ul.innerHTML = '<li class="empty">Saved takes aren\'t available in this browser.</li>'; return; }
+    if (itemKey(item) !== key) return;
+    rows.sort((a, b) => b.savedAt - a.savedAt);
+    if (!rows.length) { ul.innerHTML = '<li class="empty">No saved takes yet. Say the item, then tap Save this take.</li>'; return; }
+    ul.innerHTML = '';
+    rows.forEach(r => {
+      const li = document.createElement('li'); if (take && take.savedId === r.id) li.className = 'current';
+      const d = new Date(r.savedAt);
+      const when = d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' }) + ' ' + d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+      li.innerHTML = `<span class="when">${esc(when)} <small>· ${r.p5 == null ? '–' : r.p5 + '%'} in band · ${r.p10 == null ? '–' : r.p10 + '%'} within 10 Hz</small></span>`;
+      const play = document.createElement('button'); play.textContent = '▶ Play'; play.onclick = () => { showSaved(r); playTake(); };
+      const show = document.createElement('button'); show.textContent = 'Show'; show.onclick = () => showSaved(r);
+      const del = document.createElement('button'); del.textContent = 'Delete';
+      del.onclick = async () => {
+        if (!del.dataset.armed) { del.dataset.armed = 1; del.textContent = 'Tap again to delete'; del.classList.add('danger'); setTimeout(() => { if (del.isConnected) { delete del.dataset.armed; del.textContent = 'Delete'; del.classList.remove('danger'); } }, 3000); return; }
+        try { await tx('readwrite', os => os.delete(r.id)); } catch (e) {}
+        if (take && take.savedId === r.id) take.savedId = null;
+        updateTakeButtons(); renderSaved();
+      };
+      li.append(play, show, del); ul.appendChild(li);
+    });
+  }
+  function showSaved(r) {
+    stopPlayback();
+    const i16 = new Int16Array(r.pcm), x = new Float32Array(i16.length); for (let i = 0; i < x.length; i++) x[i] = i16[i] / 32768;
+    if (take && take !== null && !take.savedId) lastTake = take;
+    const t = { frames: r.frames.map(([ms, hz]) => ({ t: ms / 1000, hz })), done: true, audio: x, sr: 16000, audioStart: 0, savedId: r.id, map: tt => tt };
+    take = t; finishTake(t);
+    const when = new Date(r.savedAt).toLocaleString(undefined, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+    status('Showing your saved take from ' + when + '.');
+    renderSaved(); draw();
+  }
+  let playing = null;
+  function stopPlayback() { if (playing) { try { playing.node.stop(); } catch (e) {} playing = null; $('playTake').textContent = '▶ Play this take'; draw(); } }
+  function playTake() {
+    const t = take; if (!t || !t.audio) return;
+    if (playing) { const same = playing.take === t; stopPlayback(); if (same) return; }
+    ac = ac || new (window.AudioContext || window.webkitAudioContext)();
+    ac.resume();
+    const buf = ac.createBuffer(1, t.audio.length, t.sr); buf.getChannelData(0).set(t.audio);
+    const node = ac.createBufferSource(); node.buffer = buf; node.connect(ac.destination);
+    const t0 = ac.currentTime + 0.05; node.start(t0);
+    playing = { take: t, node, pos: t.audioStart || 0 };
+    $('playTake').textContent = '■ Stop';
+    node.onended = () => { if (playing && playing.node === node) stopPlayback(); };
+    const tick = () => { if (!playing || playing.node !== node) return; playing.pos = (t.audioStart || 0) + Math.max(0, ac.currentTime - t0); if (!running) draw(); requestAnimationFrame(tick); };
+    tick();
+  }
+  $('saveTake').onclick = saveTake;
+  $('playTake').onclick = playTake;
+
   // ---------- wiring ----------
   $('mic').onclick = () => running ? stopMic() : startMic();
   daySel.onchange = () => fillItems(0);
@@ -441,7 +559,7 @@ summary { cursor: pointer; color: var(--ink); }
   $('next').onclick = () => { if (+itemSel.value < items.length - 1) { itemSel.value = +itemSel.value + 1; setItem(); } };
   document.querySelectorAll('.seg button').forEach(b => b.onclick = () => {
     speed = +b.dataset.speed; document.querySelectorAll('.seg button').forEach(o => o.setAttribute('aria-pressed', o === b));
-    store.set('pp-speed', speed); lastTake = null; take = null; resetScores(); draw();
+    store.set('pp-speed', speed); if (take && take.done) finishTake(take); if (lastTake && lastTake.done) { const k = take; finishTake(lastTake); if (k) finishTake(k); } draw();
   });
   const sp = store.get('pp-speed'); if (sp) { speed = +sp; document.querySelectorAll('.seg button').forEach(o => o.setAttribute('aria-pressed', o.dataset.speed == sp)); }
   window.addEventListener('resize', resize);
@@ -449,7 +567,7 @@ summary { cursor: pointer; color: var(--ink); }
   new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
   fillDays(); fillItems();
   resize();
-  window.__pp = { yin, framesFromSamples, get take() { return take; }, get item() { return item; } };
+  window.__pp = { yin, framesFromSamples, get take() { return take; }, get item() { return item; }, get playing() { return playing; } };
 })();
 </script>
 </body></html>
